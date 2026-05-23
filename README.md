@@ -1,6 +1,10 @@
-# WA Sticker Bot on Koyeb + Turso v7
+# WA Sticker Bot on Koyeb + Turso v8
 
-Perbaikan v7:
+Perbaikan v8:
+- Tambah owner whitelist dinamis di Turso: tidak perlu edit env untuk tambah nomor/LID.
+- Tambah `/claim ADMIN_KEY` agar nomor yang sedang chat bisa mendaftarkan dirinya sendiri.
+- Tambah `/addowner`, `/removeowner`, dan `/owners`.
+- Fix parsing LID/PN agar koma di env tetap boleh, tapi DB owner jadi metode utama.
 - Fix penting untuk Baileys v7 LID: pesan private bisa datang sebagai `@lid`, bukan `@s.whatsapp.net`.
 - Tambah whitelist `OWNER_LIDS`.
 - Tambah command `/whoami` untuk melihat LID pengirim.
@@ -108,3 +112,32 @@ OWNER_LIDS=110858038444128,3229882572954
 ```
 
 Lalu redeploy. Di v6 dan sebelumnya, hanya `OWNER_NUMBERS` yang dicek, sehingga pesan `@lid` selalu dianggap non-owner.
+
+
+## Owner command v8
+
+Jika pesan masih dianggap non-owner, kirim dari nomor yang ingin diizinkan:
+
+```text
+/claim ADMIN_KEY_KAMU
+```
+
+Contoh:
+
+```text
+/claim zhiv-sticker-bot-acak-panjang-123456
+```
+
+Setelah berhasil, owner tersimpan di Turso. Tidak perlu edit `OWNER_LIDS` dan tidak perlu redeploy.
+
+Command lain:
+
+```text
+/whoami
+/owners
+/addowner lid:3229882572954
+/addowner pn:62881025616260
+/removeowner lid:3229882572954
+```
+
+`OWNER_NUMBERS` dan `OWNER_LIDS` tetap boleh dipakai sebagai bootstrap/fallback, tetapi v8 lebih nyaman memakai DB owner.

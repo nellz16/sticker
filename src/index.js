@@ -11,11 +11,11 @@ import makeWASocket, {
   normalizeMessageContent
 } from "baileys";
 
-import { initDb, logEvent } from "./db.js";
+import { initDb, logEvent, addOwner, removeOwner, listOwners, isDbOwner } from "./db.js";
 import { useTursoAuthState, clearAuthState } from "./auth-turso.js";
 import { makeSticker, parseStickerOptions } from "./sticker.js";
 
-const BUILD_VERSION = "7.0.0";
+const BUILD_VERSION = "8.0.0";
 const PORT = Number(process.env.PORT || 8000);
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const ADMIN_KEY = process.env.ADMIN_KEY;
@@ -445,16 +445,29 @@ function getSenderIdentity(msg) {
   };
 }
 
-function isAllowedMessage(msg) {
+async function isAllowedMessage(msg) {
   if (ALLOW_ALL_PRIVATE) return true;
-  if (OWNER_NUMBERS.length === 0 && OWNER_LIDS.length === 0) return true;
 
   const identity = getSenderIdentity(msg);
 
-  const pnAllowed = identity.pnNumbers.some((number) => OWNER_NUMBERS.includes(number));
-  const lidAllowed = identity.lidIds.some((lid) => OWNER_LIDS.includes(lid));
+  const pnAllowedByEnv = identity.pnNumbers.some((number) => OWNER_NUMBERS.includes(number));
+  const lidAllowedByEnv = identity.lidIds.some((lid) => OWNER_LIDS.includes(lid));
 
-  return pnAllowed || lidAllowed;
+  if (pnAllowedByEnv || lidAllowedByEnv) return true;
+
+  for (const number of identity.pnNumbers) {
+    if (await isDbOwner("pn", number)) return true;
+  }
+
+  for (const lid of identity.lidIds) {
+    if (await isDbOwner("lid", lid)) return true;
+  }
+
+  // Backward-compatible default: if no owners configured anywhere, allow private messages.
+  const dbOwners = await listOwners();
+  if (OWNER_NUMBERS.length === 0 && OWNER_LIDS.length === 0 && dbOwners.length === 0) return true;
+
+  return false;
 }
 
 function ownerHint(msg) {
@@ -466,7 +479,10 @@ function ownerHint(msg) {
     `Detected PN numbers: ${identity.pnNumbers.join(", ") || "-"}`,
     `Detected LID IDs: ${identity.lidIds.join(", ") || "-"}`,
     "",
-    "Tambahkan LID yang sesuai ke environment variable Koyeb:",
+    "Cara cepat tanpa edit env:",
+    "/claim ADMIN_KEY",
+    "",
+    "Atau tambahkan LID ke environment variable Koyeb:",
     `OWNER_LIDS=${identity.lidIds.join(",") || "ISI_LID_DI_SINI"}`,
     "",
     "Lalu redeploy."
@@ -490,17 +506,40 @@ async function handleIncomingMessage(msg) {
     content.documentMessage?.caption ||
     "";
 
-  if (text.trim().toLowerCase() === "/whoami") {
+  const trimmedText = text.trim();
+  const lowerText = trimmedText.toLowerCase();
+
+  if (lowerText === "/whoami") {
     await sock.sendMessage(jid, { text: ownerHint(msg) }, { quoted: msg });
     return;
   }
 
-  if (!isAllowedMessage(msg)) {
+  if (lowerText.startsWith("/claim ")) {
+    await handleClaimOwner(jid, msg, trimmedText);
+    return;
+  }
+
+  if (!(await isAllowedMessage(msg))) {
     logger.warn({ jid, identity: getSenderIdentity(msg) }, "Ignoring non-owner sender");
     return;
   }
 
-  if (text.trim().toLowerCase() === "/help") {
+  if (lowerText === "/owners") {
+    await sock.sendMessage(jid, { text: await ownersText() }, { quoted: msg });
+    return;
+  }
+
+  if (lowerText.startsWith("/addowner ")) {
+    await handleAddOwnerCommand(jid, msg, trimmedText);
+    return;
+  }
+
+  if (lowerText.startsWith("/removeowner ")) {
+    await handleRemoveOwnerCommand(jid, msg, trimmedText);
+    return;
+  }
+
+  if (lowerText === "/help") {
     await sock.sendMessage(jid, { text: helpText() }, { quoted: msg });
     return;
   }
@@ -546,6 +585,127 @@ async function handleIncomingMessage(msg) {
   await logEvent("sticker_sent", `${result.bytes} bytes, q=${result.quality}, box=${result.boxSize}`);
 }
 
+
+async function handleClaimOwner(jid, msg, text) {
+  const [, providedKey] = text.split(/\s+/, 2);
+
+  if (!providedKey || providedKey !== ADMIN_KEY) {
+    await sock.sendMessage(jid, { text: "ADMIN_KEY salah. Format: /claim ADMIN_KEY" }, { quoted: msg });
+    return;
+  }
+
+  const identity = getSenderIdentity(msg);
+  const added = [];
+
+  for (const number of identity.pnNumbers) {
+    added.push(await addOwner("pn", number, "claimed", "claim"));
+  }
+
+  for (const lid of identity.lidIds) {
+    added.push(await addOwner("lid", lid, "claimed", "claim"));
+  }
+
+  await sock.sendMessage(
+    jid,
+    {
+      text: [
+        "Owner berhasil ditambahkan ke database Turso.",
+        "",
+        ...added.map((item) => `- ${item.type}: ${item.value}`),
+        "",
+        "Sekarang coba kirim /status atau gambar."
+      ].join("\n")
+    },
+    { quoted: msg }
+  );
+}
+
+function parseOwnerValue(raw) {
+  const value = String(raw || "").trim();
+  const digits = value.replace(/[^\d]/g, "");
+
+  if (!digits) throw new Error("Value kosong");
+
+  if (value.includes("@lid") || value.toLowerCase().startsWith("lid:")) {
+    return { type: "lid", value: digits };
+  }
+
+  if (value.includes("@s.whatsapp.net") || value.toLowerCase().startsWith("pn:") || digits.startsWith("62")) {
+    return { type: "pn", value: digits };
+  }
+
+  // LID biasanya bukan nomor telepon 62..., jadi default ke lid.
+  return { type: "lid", value: digits };
+}
+
+async function handleAddOwnerCommand(jid, msg, text) {
+  try {
+    const parts = text.split(/\s+/).slice(1);
+    if (parts.length === 0) {
+      await sock.sendMessage(jid, { text: "Format: /addowner 3229882572954 atau /addowner lid:3229882572954" }, { quoted: msg });
+      return;
+    }
+
+    const added = [];
+    for (const part of parts) {
+      const parsed = parseOwnerValue(part);
+      added.push(await addOwner(parsed.type, parsed.value, "manual", "command"));
+    }
+
+    await sock.sendMessage(
+      jid,
+      { text: ["Owner ditambahkan:", ...added.map((item) => `- ${item.type}: ${item.value}`)].join("\n") },
+      { quoted: msg }
+    );
+  } catch (error) {
+    await sock.sendMessage(jid, { text: `Gagal add owner: ${String(error?.message || error)}` }, { quoted: msg });
+  }
+}
+
+async function handleRemoveOwnerCommand(jid, msg, text) {
+  try {
+    const parts = text.split(/\s+/).slice(1);
+    if (parts.length === 0) {
+      await sock.sendMessage(jid, { text: "Format: /removeowner 3229882572954 atau /removeowner lid:3229882572954" }, { quoted: msg });
+      return;
+    }
+
+    const removed = [];
+    for (const part of parts) {
+      const parsed = parseOwnerValue(part);
+      const count = await removeOwner(parsed.type, parsed.value);
+      removed.push(`${parsed.type}:${parsed.value} (${count ? "removed" : "not found"})`);
+    }
+
+    await sock.sendMessage(jid, { text: ["Remove owner:", ...removed.map((x) => `- ${x}`)].join("\n") }, { quoted: msg });
+  } catch (error) {
+    await sock.sendMessage(jid, { text: `Gagal remove owner: ${String(error?.message || error)}` }, { quoted: msg });
+  }
+}
+
+async function ownersText() {
+  const dbOwners = await listOwners();
+
+  return [
+    "Owner whitelist",
+    "",
+    `ENV OWNER_NUMBERS count: ${OWNER_NUMBERS.length}`,
+    `ENV OWNER_LIDS count: ${OWNER_LIDS.length}`,
+    `DB owners count: ${dbOwners.length}`,
+    "",
+    "DB owners:",
+    ...(dbOwners.length
+      ? dbOwners.map((item) => `- ${item.type}: ${item.value}${item.label ? ` (${item.label})` : ""}`)
+      : ["- belum ada"]),
+    "",
+    "Command:",
+    "/whoami",
+    "/claim ADMIN_KEY",
+    "/addowner lid:ID_LID",
+    "/removeowner lid:ID_LID"
+  ].join("\n");
+}
+
 function helpText() {
   return [
     "Kirim gambar/foto, nanti aku balas sebagai sticker.",
@@ -553,6 +713,10 @@ function helpText() {
     "Command:",
     "/status = cek status bot",
     "/whoami = lihat ID pengirim untuk whitelist OWNER_LIDS",
+    "/claim ADMIN_KEY = tambahkan diri sendiri sebagai owner",
+    "/owners = list owner dari DB",
+    "/addowner lid:ID = tambah owner",
+    "/removeowner lid:ID = hapus owner",
     "",
     "Caption opsional:",
     "contain = gambar utuh, default",
@@ -574,7 +738,8 @@ function statusText() {
     `state: ${connectionState}`,
     `started: ${startedAt}`,
     `last disconnect: ${lastDisconnectReason || "-"}`,
-    `memory: ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB`
+    `memory: ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB`,
+    `env owners: pn=${OWNER_NUMBERS.length}, lid=${OWNER_LIDS.length}`
   ].join("\n");
 }
 
