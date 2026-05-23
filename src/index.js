@@ -15,7 +15,7 @@ import { initDb, logEvent } from "./db.js";
 import { useTursoAuthState, clearAuthState } from "./auth-turso.js";
 import { makeSticker, parseStickerOptions } from "./sticker.js";
 
-const BUILD_VERSION = "6.0.0";
+const BUILD_VERSION = "7.0.0";
 const PORT = Number(process.env.PORT || 8000);
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const ADMIN_KEY = process.env.ADMIN_KEY;
@@ -24,6 +24,13 @@ const OWNER_NUMBERS = (process.env.OWNER_NUMBERS || "")
   .split(",")
   .map(cleanNumber)
   .filter(Boolean);
+
+const OWNER_LIDS = (process.env.OWNER_LIDS || "")
+  .split(",")
+  .map(cleanNumber)
+  .filter(Boolean);
+
+const ALLOW_ALL_PRIVATE = String(process.env.ALLOW_ALL_PRIVATE || "false").toLowerCase() === "true";
 
 const PAIRING_DELAY_MS = Number(process.env.PAIRING_DELAY_MS || 5000);
 const QR_WAIT_TIMEOUT_MS = Number(process.env.QR_WAIT_TIMEOUT_MS || 35000);
@@ -390,16 +397,82 @@ function getReadableContent(message) {
   return normalized || {};
 }
 
-function getPrivateNumberFromJid(jid) {
-  const normalized = jidNormalizedUser(jid || "");
-  if (!normalized.endsWith("@s.whatsapp.net")) return "";
-  return normalized.split("@")[0].split(":")[0];
+function normalizeAnyJid(jid) {
+  if (!jid || typeof jid !== "string") return "";
+  try {
+    return jidNormalizedUser(jid);
+  } catch {
+    return jid;
+  }
 }
 
-function isAllowedSender(jid) {
-  if (OWNER_NUMBERS.length === 0) return true;
-  const number = getPrivateNumberFromJid(jid);
-  return OWNER_NUMBERS.includes(number);
+function idPartFromJid(jid) {
+  const normalized = normalizeAnyJid(jid);
+  return normalized.split("@")[0].split(":")[0].replace(/[^\d]/g, "");
+}
+
+function jidType(jid) {
+  const normalized = normalizeAnyJid(jid);
+  if (normalized.endsWith("@s.whatsapp.net")) return "pn";
+  if (normalized.endsWith("@lid")) return "lid";
+  if (normalized.endsWith("@g.us")) return "group";
+  return "unknown";
+}
+
+function collectCandidateJids(msg) {
+  const key = msg?.key || {};
+  const candidates = [
+    key.remoteJid,
+    key.participant,
+    key.remoteJidAlt,
+    key.participantAlt,
+    key.senderPn,
+    key.senderLid
+  ].filter(Boolean);
+
+  return [...new Set(candidates.map(normalizeAnyJid).filter(Boolean))];
+}
+
+function getSenderIdentity(msg) {
+  const jids = collectCandidateJids(msg);
+  const pnJids = jids.filter((jid) => jidType(jid) === "pn");
+  const lidJids = jids.filter((jid) => jidType(jid) === "lid");
+
+  return {
+    jids,
+    pnNumbers: pnJids.map(idPartFromJid).filter(Boolean),
+    lidIds: lidJids.map(idPartFromJid).filter(Boolean)
+  };
+}
+
+function isAllowedMessage(msg) {
+  if (ALLOW_ALL_PRIVATE) return true;
+  if (OWNER_NUMBERS.length === 0 && OWNER_LIDS.length === 0) return true;
+
+  const identity = getSenderIdentity(msg);
+
+  const pnAllowed = identity.pnNumbers.some((number) => OWNER_NUMBERS.includes(number));
+  const lidAllowed = identity.lidIds.some((lid) => OWNER_LIDS.includes(lid));
+
+  return pnAllowed || lidAllowed;
+}
+
+function ownerHint(msg) {
+  const identity = getSenderIdentity(msg);
+  const lines = [
+    "Sender belum masuk whitelist OWNER_NUMBERS/OWNER_LIDS.",
+    "",
+    `Detected JIDs: ${identity.jids.join(", ") || "-"}`,
+    `Detected PN numbers: ${identity.pnNumbers.join(", ") || "-"}`,
+    `Detected LID IDs: ${identity.lidIds.join(", ") || "-"}`,
+    "",
+    "Tambahkan LID yang sesuai ke environment variable Koyeb:",
+    `OWNER_LIDS=${identity.lidIds.join(",") || "ISI_LID_DI_SINI"}`,
+    "",
+    "Lalu redeploy."
+  ];
+
+  return lines.join("\\n");
 }
 
 async function handleIncomingMessage(msg) {
@@ -407,11 +480,6 @@ async function handleIncomingMessage(msg) {
 
   const jid = msg.key.remoteJid;
   if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") return;
-
-  if (!isAllowedSender(jid)) {
-    logger.warn({ jid }, "Ignoring non-owner sender");
-    return;
-  }
 
   const content = getReadableContent(msg);
 
@@ -421,6 +489,16 @@ async function handleIncomingMessage(msg) {
     content.imageMessage?.caption ||
     content.documentMessage?.caption ||
     "";
+
+  if (text.trim().toLowerCase() === "/whoami") {
+    await sock.sendMessage(jid, { text: ownerHint(msg) }, { quoted: msg });
+    return;
+  }
+
+  if (!isAllowedMessage(msg)) {
+    logger.warn({ jid, identity: getSenderIdentity(msg) }, "Ignoring non-owner sender");
+    return;
+  }
 
   if (text.trim().toLowerCase() === "/help") {
     await sock.sendMessage(jid, { text: helpText() }, { quoted: msg });
@@ -472,6 +550,10 @@ function helpText() {
   return [
     "Kirim gambar/foto, nanti aku balas sebagai sticker.",
     "",
+    "Command:",
+    "/status = cek status bot",
+    "/whoami = lihat ID pengirim untuk whitelist OWNER_LIDS",
+    "",
     "Caption opsional:",
     "contain = gambar utuh, default",
     "cover   = crop penuh 512x512",
@@ -509,7 +591,10 @@ function publicStatus() {
     latestQrAt,
     pairingDelayMs: PAIRING_DELAY_MS,
     uptimeSeconds: Math.round(process.uptime()),
-    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    ownerNumbersConfigured: OWNER_NUMBERS.length,
+    ownerLidsConfigured: OWNER_LIDS.length,
+    allowAllPrivate: ALLOW_ALL_PRIVATE
   };
 }
 

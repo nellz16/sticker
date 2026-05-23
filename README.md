@@ -1,6 +1,10 @@
-# WA Sticker Bot on Koyeb + Turso v6
+# WA Sticker Bot on Koyeb + Turso v7
 
-Perbaikan v6:
+Perbaikan v7:
+- Fix penting untuk Baileys v7 LID: pesan private bisa datang sebagai `@lid`, bukan `@s.whatsapp.net`.
+- Tambah whitelist `OWNER_LIDS`.
+- Tambah command `/whoami` untuk melihat LID pengirim.
+- Tambah env `ALLOW_ALL_PRIVATE=false` untuk mode debugging sementara.
 - Fix penting untuk Koyeb redeploy: status 440 / `connectionReplaced` / `conflict replaced` tidak lagi menghapus auth Turso.
 - Tambah graceful shutdown SIGTERM/SIGINT: socket ditutup tanpa logout dan tanpa clear auth.
 - Bot tidak langsung membuka socket WhatsApp saat belum paired. Ini mencegah QR expired sebelum kamu membuka endpoint.
@@ -79,3 +83,28 @@ nopad   = tanpa margin tambahan jika memungkinkan
 ## Catatan redeploy Koyeb
 
 Koyeb akan menjalankan deployment baru sampai healthy, lalu menghentikan deployment lama. Untuk WhatsApp Web/Baileys, overlap singkat ini memicu status `440 connectionReplaced` pada instance lama. Di v6, status tersebut dianggap normal dan auth state di Turso tetap disimpan.
+
+
+## Fix pesan ter-ignore karena @lid
+
+Baileys v7 bisa mengirim private chat sebagai LID JID seperti:
+
+```text
+110858038444128@lid
+```
+
+Kalau log berisi `Ignoring non-owner sender`, kirim `/whoami` dari nomor utama ke bot. Bot akan membalas `Detected LID IDs`.
+
+Tambahkan ID tersebut ke Koyeb env:
+
+```env
+OWNER_LIDS=110858038444128
+```
+
+Jika ingin memasukkan lebih dari satu:
+
+```env
+OWNER_LIDS=110858038444128,3229882572954
+```
+
+Lalu redeploy. Di v6 dan sebelumnya, hanya `OWNER_NUMBERS` yang dicek, sehingga pesan `@lid` selalu dianggap non-owner.
