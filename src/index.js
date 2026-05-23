@@ -15,6 +15,7 @@ import { initDb, logEvent } from "./db.js";
 import { useTursoAuthState, clearAuthState } from "./auth-turso.js";
 import { makeSticker, parseStickerOptions } from "./sticker.js";
 
+const BUILD_VERSION = "5.0.0";
 const PORT = Number(process.env.PORT || 8000);
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const ADMIN_KEY = process.env.ADMIN_KEY;
@@ -24,6 +25,11 @@ const OWNER_NUMBERS = (process.env.OWNER_NUMBERS || "")
   .map(cleanNumber)
   .filter(Boolean);
 
+const PAIRING_DELAY_MS = Number(process.env.PAIRING_DELAY_MS || 5000);
+const QR_WAIT_TIMEOUT_MS = Number(process.env.QR_WAIT_TIMEOUT_MS || 35000);
+const WA_COUNTRY_CODE = process.env.WA_COUNTRY_CODE || "ID";
+const WA_BROWSER = (process.env.WA_BROWSER || "ubuntu").toLowerCase();
+
 const logger = pino({ level: LOG_LEVEL });
 
 if (!ADMIN_KEY) throw new Error("Missing ADMIN_KEY");
@@ -31,19 +37,24 @@ if (!BOT_PHONE_NUMBER) throw new Error("Missing BOT_PHONE_NUMBER");
 
 let sock = null;
 let connecting = false;
-let connectionState = "init";
+let connectionState = "booting";
 let lastDisconnectReason = "";
+let lastDisconnectStatusCode = null;
 let lastPairingCode = null;
 let lastPairingAt = null;
 let latestQr = null;
 let latestQrAt = null;
-const BUILD_VERSION = "4.0.0";
 let startedAt = new Date().toISOString();
 let processedQueue = Promise.resolve();
 let waiters = [];
+let activePairingUntil = 0;
 
 function cleanNumber(value) {
   return String(value).replace(/[^\d]/g, "");
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isAdmin(req) {
@@ -62,26 +73,85 @@ function enqueue(task) {
   return run;
 }
 
-async function ensureFreshSocket() {
-  if (sock && ["open", "connecting"].includes(connectionState)) return sock;
-  return restartSocket({ clearSession: false });
+function isPairingActive() {
+  return Date.now() < activePairingUntil;
 }
 
-async function restartSocket({ clearSession = false } = {}) {
+function markPairingActive(minutes = 4) {
+  activePairingUntil = Date.now() + minutes * 60_000;
+}
+
+async function isRegisteredInDb() {
+  try {
+    const { state } = await useTursoAuthState();
+    return Boolean(state?.creds?.registered);
+  } catch {
+    return false;
+  }
+}
+
+function browserConfig() {
+  if (WA_BROWSER === "windows") return Browsers.windows("Chrome");
+  if (WA_BROWSER === "macos") return Browsers.macOS("Google Chrome");
+  return Browsers.ubuntu("Chrome");
+}
+
+function getWaVersionFromEnv() {
+  const raw = process.env.WA_VERSION || "";
+  if (!raw.trim()) return null;
+
+  const parts = raw.split(",").map((x) => Number(x.trim()));
+  if (parts.length !== 3 || parts.some((x) => !Number.isInteger(x))) {
+    throw new Error("Invalid WA_VERSION. Use format like: 2,3000,1035194821");
+  }
+
+  return parts;
+}
+
+async function getWaVersion() {
+  const override = getWaVersionFromEnv();
+  if (override) {
+    return { version: override, isLatest: false, source: "env" };
+  }
+
+  try {
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    return { version, isLatest, source: "fetchLatestBaileysVersion" };
+  } catch (error) {
+    logger.warn({ error: String(error) }, "Failed to fetch latest Baileys version; using Baileys default.");
+    return { version: undefined, isLatest: false, source: "default" };
+  }
+}
+
+async function ensureSocket({ allowCreate = true } = {}) {
+  if (sock && ["open", "connecting"].includes(connectionState)) return sock;
+  if (!allowCreate) return null;
+  return startSocket();
+}
+
+async function closeSocketOnly() {
   try {
     if (sock?.ws?.close) sock.ws.close();
   } catch {}
-
-  if (clearSession) {
-    await clearAuthState();
-  }
 
   sock = null;
   connecting = false;
   latestQr = null;
   latestQrAt = null;
-  connectionState = "restarting";
+}
 
+async function restartSocket({ clearSession = false, forPairing = false } = {}) {
+  await closeSocketOnly();
+
+  if (clearSession) {
+    await clearAuthState();
+  }
+
+  if (forPairing) {
+    markPairingActive();
+  }
+
+  connectionState = forPairing ? "pairing_starting" : "restarting";
   return startSocket();
 }
 
@@ -91,31 +161,42 @@ async function startSocket() {
 
   try {
     const { state, saveCreds } = await useTursoAuthState();
-    const { version, isLatest } = await fetchLatestBaileysVersion().catch((error) => {
-      logger.warn({ error: String(error) }, "Failed to fetch latest Baileys version; using default.");
-      return { version: undefined, isLatest: false };
-    });
+    const { version, isLatest, source } = await getWaVersion();
 
-    logger.info({ version, isLatest }, "Starting WhatsApp socket");
+    logger.info(
+      {
+        buildVersion: BUILD_VERSION,
+        version,
+        isLatest,
+        versionSource: source,
+        browser: browserConfig(),
+        registered: Boolean(state?.creds?.registered)
+      },
+      "Starting WhatsApp socket"
+    );
 
     sock = makeWASocket({
       auth: state,
       logger,
       ...(version ? { version } : {}),
-      browser: Browsers.macOS("Google Chrome"),
+      browser: browserConfig(),
+      countryCode: WA_COUNTRY_CODE,
+      printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60_000,
       keepAliveIntervalMs: 20_000,
       defaultQueryTimeoutMs: 60_000,
+      retryRequestDelayMs: 2000,
+      maxMsgRetryCount: 3,
       getMessage: async () => undefined
     });
 
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, isNewLogin } = update;
 
       if (connection) {
         connectionState = connection;
@@ -125,14 +206,22 @@ async function startSocket() {
       if (qr) {
         latestQr = qr;
         latestQrAt = new Date().toISOString();
+        markPairingActive();
         logger.info("New QR received");
         notifyWaiters();
+      }
+
+      if (isNewLogin) {
+        logger.info("New login detected; waiting for forced reconnect/open.");
+        markPairingActive();
       }
 
       if (connection === "open") {
         latestQr = null;
         latestQrAt = null;
+        activePairingUntil = 0;
         lastDisconnectReason = "";
+        lastDisconnectStatusCode = null;
         logger.info("WhatsApp connected");
         await logEvent("connection", "open");
       }
@@ -142,30 +231,53 @@ async function startSocket() {
         latestQrAt = null;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        lastDisconnectStatusCode = statusCode || null;
         lastDisconnectReason = String(statusCode || lastDisconnect?.error || "unknown");
         logger.warn({ statusCode, error: String(lastDisconnect?.error) }, "WhatsApp disconnected");
 
         await logEvent("connection_close", lastDisconnectReason);
 
-        const shouldReconnect =
-          statusCode !== DisconnectReason.loggedOut &&
-          statusCode !== DisconnectReason.connectionReplaced &&
-          statusCode !== 401 &&
-          statusCode !== 440;
+        const status = statusCode;
+        const hardInvalid =
+          status === DisconnectReason.loggedOut ||
+          status === DisconnectReason.connectionReplaced ||
+          status === 401 ||
+          status === 440 ||
+          status === 500;
 
-        // This makes old closed sockets unusable for /pair and /qr.
+        const shouldReconnect =
+          status === DisconnectReason.restartRequired ||
+          status === 515 ||
+          (
+            !hardInvalid &&
+            (
+              await isRegisteredInDb() ||
+              isPairingActive()
+            )
+          );
+
         sock = null;
         connecting = false;
         notifyWaiters();
 
+        if (hardInvalid) {
+          logger.error("Auth/session invalid. Clearing auth state. Use /pair?fresh=1 or /qr?fresh=1.");
+          await clearAuthState().catch((err) => logger.error(err, "failed to clear invalid auth state"));
+          connectionState = "auth_cleared";
+          activePairingUntil = 0;
+          return;
+        }
+
         if (shouldReconnect) {
+          const reconnectDelay = status === DisconnectReason.restartRequired || status === 515 ? 1500 : 5000;
           setTimeout(() => {
             startSocket().catch((err) => logger.error(err, "reconnect failed"));
-          }, 2_000);
-        } else {
-          logger.error("Session logged out/replaced/invalid. Auth state will be cleared before the next pairing attempt.");
-          await clearAuthState().catch((err) => logger.error(err, "failed to clear invalid auth state"));
+          }, reconnectDelay);
+          return;
         }
+
+        connectionState = "unpaired_idle";
+        logger.info("No valid session and no active pairing window; staying idle until /pair or /qr.");
       }
     });
 
@@ -185,12 +297,11 @@ async function startSocket() {
   }
 }
 
-async function waitForPairingReady(timeoutMs = 25_000) {
+async function waitForPairingSignal(timeoutMs = QR_WAIT_TIMEOUT_MS) {
   const started = Date.now();
 
   while (Date.now() - started < timeoutMs) {
-    if (latestQr || connectionState === "connecting") return true;
-    if (connectionState === "open") return true;
+    if (latestQr || connectionState === "connecting" || connectionState === "open") return true;
 
     await new Promise((resolve) => {
       const timer = setTimeout(resolve, 500);
@@ -204,20 +315,34 @@ async function waitForPairingReady(timeoutMs = 25_000) {
   return false;
 }
 
-async function requestPairingCode() {
-  await ensureFreshSocket();
+async function requestPairingCode({ fresh = false } = {}) {
+  markPairingActive();
+
+  if (fresh) {
+    await restartSocket({ clearSession: true, forPairing: true });
+  } else {
+    await ensureSocket();
+  }
 
   if (!sock) throw new Error("Socket is not ready");
   if (sock.authState.creds.registered || connectionState === "open") {
     return { registered: true, code: null };
   }
 
-  const ready = await waitForPairingReady(25_000);
+  const ready = await waitForPairingSignal(QR_WAIT_TIMEOUT_MS);
   if (!ready) {
-    throw new Error("Socket not ready for pairing. Try /restart then /pair again, or use /qr.");
+    throw new Error("Socket not ready for pairing. Try /restart then /pair?fresh=1, or use /qr?fresh=1.");
   }
 
   if (!sock) throw new Error("Socket closed before requesting pairing code");
+
+  // Workaround for Baileys v7 pairing race:
+  // wait after connecting/QR before requestPairingCode().
+  await delay(PAIRING_DELAY_MS);
+
+  if (!sock || connectionState === "close" || connectionState === "auth_cleared") {
+    throw new Error("Socket closed during pairing delay. Try /pair?fresh=1 again.");
+  }
 
   const code = await sock.requestPairingCode(BOT_PHONE_NUMBER);
   lastPairingCode = code;
@@ -227,17 +352,18 @@ async function requestPairingCode() {
   return { registered: false, code };
 }
 
-async function requestFreshPairingCode() {
-  await restartSocket({ clearSession: true });
-  return requestPairingCode();
-}
+async function getQrDataUrl({ fresh = false } = {}) {
+  markPairingActive();
 
-async function getQrDataUrl() {
-  await ensureFreshSocket();
+  if (fresh) {
+    await restartSocket({ clearSession: true, forPairing: true });
+  } else {
+    await ensureSocket();
+  }
 
   if (connectionState === "open") return null;
 
-  const ready = await waitForPairingReady(25_000);
+  const ready = await waitForPairingSignal(QR_WAIT_TIMEOUT_MS);
   if (!ready || !latestQr) {
     throw new Error("QR not ready yet. Refresh this endpoint in a few seconds or call /restart.");
   }
@@ -352,6 +478,7 @@ function helpText() {
 
 function statusText() {
   return [
+    `build: ${BUILD_VERSION}`,
     `state: ${connectionState}`,
     `started: ${startedAt}`,
     `last disconnect: ${lastDisconnectReason || "-"}`,
@@ -366,9 +493,11 @@ function publicStatus() {
     state: connectionState,
     startedAt,
     lastDisconnectReason: lastDisconnectReason || null,
+    lastDisconnectStatusCode,
     lastPairingAt,
     hasQr: Boolean(latestQr),
     latestQrAt,
+    pairingDelayMs: PAIRING_DELAY_MS,
     uptimeSeconds: Math.round(process.uptime()),
     memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024)
   };
@@ -376,7 +505,14 @@ function publicStatus() {
 
 async function main() {
   await initDb();
-  await startSocket();
+
+  if (await isRegisteredInDb()) {
+    connectionState = "registered_starting";
+    await startSocket();
+  } else {
+    connectionState = "unpaired_idle";
+    logger.info({ buildVersion: BUILD_VERSION }, "No registered session. Socket will start only when /pair or /qr is opened.");
+  }
 
   const app = express();
   app.use(express.json());
@@ -387,10 +523,11 @@ async function main() {
         <head><title>WA Sticker Bot</title></head>
         <body style="font-family: system-ui; max-width: 760px; margin: 40px auto; line-height: 1.6;">
           <h1>WA Sticker Bot</h1>
+          <p>Build: <b>${BUILD_VERSION}</b></p>
           <p>Status: <b>${connectionState}</b></p>
           <p>Health: <a href="/health">/health</a></p>
-          <p>Pairing code: <code>/pair?key=ADMIN_KEY</code><br/>Fresh pairing: <code>/pair?key=ADMIN_KEY&fresh=1</code></p>
-          <p>QR fallback: <code>/qr?key=ADMIN_KEY</code></p>
+          <p>Pairing code fresh: <code>/pair?key=ADMIN_KEY&fresh=1</code></p>
+          <p>QR fresh: <code>/qr?key=ADMIN_KEY&fresh=1</code></p>
         </body>
       </html>
     `);
@@ -409,9 +546,7 @@ async function main() {
     if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const result = req.query.fresh === "1"
-        ? await requestFreshPairingCode()
-        : await requestPairingCode();
+      const result = await requestPairingCode({ fresh: req.query.fresh === "1" });
 
       if (result.registered) {
         return res.json({
@@ -426,6 +561,7 @@ async function main() {
         registered: false,
         pairingCode: result.code,
         phoneNumber: BOT_PHONE_NUMBER,
+        pairingDelayMs: PAIRING_DELAY_MS,
         expiresHint: "Masukkan kode ini secepatnya di WhatsApp > Perangkat tertaut > Tautkan dengan nomor telepon."
       });
     } catch (error) {
@@ -433,7 +569,7 @@ async function main() {
       res.status(500).json({
         ok: false,
         error: String(error?.message || error),
-        suggestion: "Call POST /restart?key=ADMIN_KEY, wait 5 seconds, then try /pair again. If it still fails, use /qr."
+        suggestion: "Call /pair?key=ADMIN_KEY&fresh=1 once. If it still fails, try /qr?key=ADMIN_KEY&fresh=1 from a second screen."
       });
     }
   });
@@ -442,7 +578,7 @@ async function main() {
     if (!isAdmin(req)) return res.status(401).send("Unauthorized");
 
     try {
-      const dataUrl = await getQrDataUrl();
+      const dataUrl = await getQrDataUrl({ fresh: req.query.fresh === "1" });
 
       if (!dataUrl) {
         return res.type("html").send(`
@@ -460,10 +596,11 @@ async function main() {
           <head>
             <title>WA Sticker Bot QR</title>
             <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <meta http-equiv="refresh" content="25">
           </head>
           <body style="font-family: system-ui; max-width: 720px; margin: 32px auto; text-align: center; line-height: 1.5;">
             <h1>Scan QR WhatsApp</h1>
-            <p>QR ini cepat kedaluwarsa. Kalau gagal, refresh halaman.</p>
+            <p>QR akan refresh otomatis tiap 25 detik. Scan dari layar kedua lebih stabil.</p>
             <img src="${dataUrl}" style="width: min(88vw, 420px); height: auto; image-rendering: pixelated;" />
             <p><small>State: ${connectionState} | QR at: ${latestQrAt || "-"}</small></p>
           </body>
@@ -476,7 +613,7 @@ async function main() {
           <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
             <h1>QR belum siap</h1>
             <pre>${String(error?.message || error)}</pre>
-            <p>Coba refresh halaman, atau panggil POST /restart?key=ADMIN_KEY.</p>
+            <p>Coba refresh halaman, atau buka <code>/qr?key=ADMIN_KEY&fresh=1</code>.</p>
           </body>
         </html>
       `);
@@ -487,8 +624,8 @@ async function main() {
     if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      await restartSocket({ clearSession: false });
-      res.json({ ok: true, message: "Socket restarted. Wait a few seconds, then open /pair or /qr." });
+      await restartSocket({ clearSession: false, forPairing: false });
+      res.json({ ok: true, message: "Socket restarted. Wait a few seconds, then open /pair?fresh=1 or /qr?fresh=1." });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error?.message || error) });
     }
@@ -498,8 +635,11 @@ async function main() {
     if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      await restartSocket({ clearSession: true });
-      res.json({ ok: true, message: "Auth state cleared. Wait 5-10 seconds, then open /pair?fresh=1 or /qr." });
+      await closeSocketOnly();
+      await clearAuthState();
+      connectionState = "unpaired_idle";
+      activePairingUntil = 0;
+      res.json({ ok: true, message: "Auth state cleared. Open /pair?fresh=1 or /qr?fresh=1." });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error?.message || error) });
     }
@@ -512,15 +652,18 @@ async function main() {
       if (sock?.logout) {
         await sock.logout().catch(() => {});
       }
-      await restartSocket({ clearSession: true });
-      res.json({ ok: true, message: "Session cleared. Wait a few seconds, then open /pair or /qr." });
+      await closeSocketOnly();
+      await clearAuthState();
+      connectionState = "unpaired_idle";
+      activePairingUntil = 0;
+      res.json({ ok: true, message: "Logged out and session cleared. Open /pair?fresh=1 or /qr?fresh=1." });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error?.message || error) });
     }
   });
 
   app.listen(PORT, "0.0.0.0", () => {
-    logger.info({ port: PORT }, "HTTP server listening");
+    logger.info({ buildVersion: BUILD_VERSION, port: PORT }, "HTTP server listening");
   });
 }
 
