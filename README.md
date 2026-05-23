@@ -1,10 +1,12 @@
-# WA Sticker Bot on Koyeb + Turso v3
+# WA Sticker Bot on Koyeb + Turso v4
 
-Perbaikan v3:
+Perbaikan v4:
 - Endpoint pairing code dibuat lebih aman: menunggu event `connecting` atau `qr`.
 - Jika socket sudah `close`, endpoint `/pair` otomatis membuat socket baru.
 - Tambah fallback endpoint QR: `/qr?key=ADMIN_KEY`.
-- Tambah endpoint `/restart?key=ADMIN_KEY`.
+- Tambah endpoint `/restart?key=ADMIN_KEY` dan `/reset-auth?key=ADMIN_KEY`.
+- Tambah `/pair?key=ADMIN_KEY&fresh=1` untuk pairing dari sesi bersih.
+- Jika auth invalid 401/440, session Turso akan dibersihkan agar tidak stuck.
 - Setelah pairing/scan, disconnect `restartRequired` dianggap normal dan auto-reconnect.
 
 ## Endpoint
@@ -13,8 +15,10 @@ Perbaikan v3:
 GET  /health
 GET  /status?key=ADMIN_KEY
 GET  /pair?key=ADMIN_KEY
+GET  /pair?key=ADMIN_KEY&fresh=1
 GET  /qr?key=ADMIN_KEY
 POST /restart?key=ADMIN_KEY
+POST /reset-auth?key=ADMIN_KEY
 POST /logout?key=ADMIN_KEY
 ```
 

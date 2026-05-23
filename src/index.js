@@ -37,6 +37,7 @@ let lastPairingCode = null;
 let lastPairingAt = null;
 let latestQr = null;
 let latestQrAt = null;
+const BUILD_VERSION = "4.0.0";
 let startedAt = new Date().toISOString();
 let processedQueue = Promise.resolve();
 let waiters = [];
@@ -162,7 +163,8 @@ async function startSocket() {
             startSocket().catch((err) => logger.error(err, "reconnect failed"));
           }, 2_000);
         } else {
-          logger.error("Session logged out/replaced. Clear session and pair again if needed.");
+          logger.error("Session logged out/replaced/invalid. Auth state will be cleared before the next pairing attempt.");
+          await clearAuthState().catch((err) => logger.error(err, "failed to clear invalid auth state"));
         }
       }
     });
@@ -223,6 +225,11 @@ async function requestPairingCode() {
 
   await logEvent("pairing_code", "Pairing code generated");
   return { registered: false, code };
+}
+
+async function requestFreshPairingCode() {
+  await restartSocket({ clearSession: true });
+  return requestPairingCode();
 }
 
 async function getQrDataUrl() {
@@ -355,6 +362,7 @@ function statusText() {
 function publicStatus() {
   return {
     ok: true,
+    buildVersion: BUILD_VERSION,
     state: connectionState,
     startedAt,
     lastDisconnectReason: lastDisconnectReason || null,
@@ -381,7 +389,7 @@ async function main() {
           <h1>WA Sticker Bot</h1>
           <p>Status: <b>${connectionState}</b></p>
           <p>Health: <a href="/health">/health</a></p>
-          <p>Pairing code: <code>/pair?key=ADMIN_KEY</code></p>
+          <p>Pairing code: <code>/pair?key=ADMIN_KEY</code><br/>Fresh pairing: <code>/pair?key=ADMIN_KEY&fresh=1</code></p>
           <p>QR fallback: <code>/qr?key=ADMIN_KEY</code></p>
         </body>
       </html>
@@ -401,7 +409,9 @@ async function main() {
     if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const result = await requestPairingCode();
+      const result = req.query.fresh === "1"
+        ? await requestFreshPairingCode()
+        : await requestPairingCode();
 
       if (result.registered) {
         return res.json({
@@ -479,6 +489,17 @@ async function main() {
     try {
       await restartSocket({ clearSession: false });
       res.json({ ok: true, message: "Socket restarted. Wait a few seconds, then open /pair or /qr." });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
+  app.post("/reset-auth", async (req, res) => {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
+
+    try {
+      await restartSocket({ clearSession: true });
+      res.json({ ok: true, message: "Auth state cleared. Wait 5-10 seconds, then open /pair?fresh=1 or /qr." });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error?.message || error) });
     }
