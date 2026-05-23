@@ -15,7 +15,7 @@ import { initDb, logEvent } from "./db.js";
 import { useTursoAuthState, clearAuthState } from "./auth-turso.js";
 import { makeSticker, parseStickerOptions } from "./sticker.js";
 
-const BUILD_VERSION = "5.0.0";
+const BUILD_VERSION = "6.0.0";
 const PORT = Number(process.env.PORT || 8000);
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const ADMIN_KEY = process.env.ADMIN_KEY;
@@ -238,18 +238,21 @@ async function startSocket() {
         await logEvent("connection_close", lastDisconnectReason);
 
         const status = statusCode;
+        const replacedByAnotherConnection =
+          status === DisconnectReason.connectionReplaced ||
+          status === 440 ||
+          String(lastDisconnect?.error || "").toLowerCase().includes("conflict");
+
         const hardInvalid =
           status === DisconnectReason.loggedOut ||
-          status === DisconnectReason.connectionReplaced ||
-          status === 401 ||
-          status === 440 ||
-          status === 500;
+          status === 401;
 
         const shouldReconnect =
           status === DisconnectReason.restartRequired ||
           status === 515 ||
           (
             !hardInvalid &&
+            !replacedByAnotherConnection &&
             (
               await isRegisteredInDb() ||
               isPairingActive()
@@ -260,8 +263,15 @@ async function startSocket() {
         connecting = false;
         notifyWaiters();
 
+        if (replacedByAnotherConnection) {
+          logger.warn("Connection was replaced by another active instance. This is normal during Koyeb redeploy; auth state is kept intact.");
+          connectionState = "replaced_by_another_instance";
+          activePairingUntil = 0;
+          return;
+        }
+
         if (hardInvalid) {
-          logger.error("Auth/session invalid. Clearing auth state. Use /pair?fresh=1 or /qr?fresh=1.");
+          logger.error("Auth/session logged out. Clearing auth state. Use /pair?fresh=1 or /qr?fresh=1.");
           await clearAuthState().catch((err) => logger.error(err, "failed to clear invalid auth state"));
           connectionState = "auth_cleared";
           activePairingUntil = 0;
@@ -502,6 +512,26 @@ function publicStatus() {
     memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024)
   };
 }
+
+
+async function gracefulShutdown(signal) {
+  logger.warn({ signal }, "Graceful shutdown requested. Closing socket without logging out or clearing auth.");
+  try {
+    if (sock?.ws?.close) sock.ws.close();
+  } catch (error) {
+    logger.warn({ error: String(error) }, "Error while closing socket during shutdown");
+  }
+
+  setTimeout(() => process.exit(0), 500).unref();
+}
+
+process.once("SIGTERM", () => {
+  gracefulShutdown("SIGTERM").catch(() => process.exit(0));
+});
+
+process.once("SIGINT", () => {
+  gracefulShutdown("SIGINT").catch(() => process.exit(0));
+});
 
 async function main() {
   await initDb();

@@ -1,6 +1,8 @@
-# WA Sticker Bot on Koyeb + Turso v5
+# WA Sticker Bot on Koyeb + Turso v6
 
-Perbaikan v5:
+Perbaikan v6:
+- Fix penting untuk Koyeb redeploy: status 440 / `connectionReplaced` / `conflict replaced` tidak lagi menghapus auth Turso.
+- Tambah graceful shutdown SIGTERM/SIGINT: socket ditutup tanpa logout dan tanpa clear auth.
 - Bot tidak langsung membuka socket WhatsApp saat belum paired. Ini mencegah QR expired sebelum kamu membuka endpoint.
 - Pairing code menunggu event connecting/QR, lalu delay 5 detik sebelum `requestPairingCode()`.
 - Endpoint fresh pairing: `/pair?key=ADMIN_KEY&fresh=1`.
@@ -38,7 +40,7 @@ Jangan isi `WA_VERSION` dulu. Pakai hanya kalau versi terbaru dari Baileys sedan
 
 1. Deploy v5.
 2. Buka `/health` dan pastikan `buildVersion` = `5.0.0`.
-3. Jalankan reset auth:
+3. Jika sesi sebelumnya sudah terhapus oleh versi lama, jalankan reset auth dan pairing ulang. Kalau setelah v6 state sudah `open`, langkah reset tidak perlu:
 
 ```bash
 curl -X POST "https://APP-KAMU.koyeb.app/reset-auth?key=ADMIN_KEY"
@@ -50,7 +52,7 @@ curl -X POST "https://APP-KAMU.koyeb.app/reset-auth?key=ADMIN_KEY"
 https://APP-KAMU.koyeb.app/pair?key=ADMIN_KEY&fresh=1
 ```
 
-5. Kalau code gagal 2 kali, gunakan QR dari layar kedua:
+5. Untuk redeploy berikutnya, jangan reset auth. Kalau code gagal 2 kali, gunakan QR dari layar kedua:
 
 ```text
 https://APP-KAMU.koyeb.app/qr?key=ADMIN_KEY&fresh=1
@@ -72,3 +74,8 @@ pixel   = pixel art, tidak blur/smoothing
 white   = background putih
 nopad   = tanpa margin tambahan jika memungkinkan
 ```
+
+
+## Catatan redeploy Koyeb
+
+Koyeb akan menjalankan deployment baru sampai healthy, lalu menghentikan deployment lama. Untuk WhatsApp Web/Baileys, overlap singkat ini memicu status `440 connectionReplaced` pada instance lama. Di v6, status tersebut dianggap normal dan auth state di Turso tetap disimpan.
