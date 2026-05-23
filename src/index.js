@@ -1,10 +1,12 @@
 import "dotenv/config";
 import express from "express";
 import pino from "pino";
+import QRCode from "qrcode";
 import makeWASocket, {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
+  fetchLatestBaileysVersion,
   jidNormalizedUser,
   normalizeMessageContent
 } from "baileys";
@@ -33,8 +35,11 @@ let connectionState = "init";
 let lastDisconnectReason = "";
 let lastPairingCode = null;
 let lastPairingAt = null;
+let latestQr = null;
+let latestQrAt = null;
 let startedAt = new Date().toISOString();
 let processedQueue = Promise.resolve();
+let waiters = [];
 
 function cleanNumber(value) {
   return String(value).replace(/[^\d]/g, "");
@@ -44,10 +49,39 @@ function isAdmin(req) {
   return req.query.key && req.query.key === ADMIN_KEY;
 }
 
+function notifyWaiters() {
+  const all = waiters;
+  waiters = [];
+  for (const resolve of all) resolve();
+}
+
 function enqueue(task) {
   const run = processedQueue.then(task, task);
   processedQueue = run.catch(() => {});
   return run;
+}
+
+async function ensureFreshSocket() {
+  if (sock && ["open", "connecting"].includes(connectionState)) return sock;
+  return restartSocket({ clearSession: false });
+}
+
+async function restartSocket({ clearSession = false } = {}) {
+  try {
+    if (sock?.ws?.close) sock.ws.close();
+  } catch {}
+
+  if (clearSession) {
+    await clearAuthState();
+  }
+
+  sock = null;
+  connecting = false;
+  latestQr = null;
+  latestQrAt = null;
+  connectionState = "restarting";
+
+  return startSocket();
 }
 
 async function startSocket() {
@@ -56,12 +90,18 @@ async function startSocket() {
 
   try {
     const { state, saveCreds } = await useTursoAuthState();
+    const { version, isLatest } = await fetchLatestBaileysVersion().catch((error) => {
+      logger.warn({ error: String(error) }, "Failed to fetch latest Baileys version; using default.");
+      return { version: undefined, isLatest: false };
+    });
+
+    logger.info({ version, isLatest }, "Starting WhatsApp socket");
 
     sock = makeWASocket({
       auth: state,
       logger,
+      ...(version ? { version } : {}),
       browser: Browsers.macOS("Google Chrome"),
-      printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
@@ -74,17 +114,32 @@ async function startSocket() {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect } = update;
+      const { connection, lastDisconnect, qr } = update;
 
-      if (connection) connectionState = connection;
+      if (connection) {
+        connectionState = connection;
+        notifyWaiters();
+      }
+
+      if (qr) {
+        latestQr = qr;
+        latestQrAt = new Date().toISOString();
+        logger.info("New QR received");
+        notifyWaiters();
+      }
 
       if (connection === "open") {
+        latestQr = null;
+        latestQrAt = null;
         lastDisconnectReason = "";
         logger.info("WhatsApp connected");
         await logEvent("connection", "open");
       }
 
       if (connection === "close") {
+        latestQr = null;
+        latestQrAt = null;
+
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         lastDisconnectReason = String(statusCode || lastDisconnect?.error || "unknown");
         logger.warn({ statusCode, error: String(lastDisconnect?.error) }, "WhatsApp disconnected");
@@ -93,14 +148,21 @@ async function startSocket() {
 
         const shouldReconnect =
           statusCode !== DisconnectReason.loggedOut &&
-          statusCode !== DisconnectReason.connectionReplaced;
+          statusCode !== DisconnectReason.connectionReplaced &&
+          statusCode !== 401 &&
+          statusCode !== 440;
+
+        // This makes old closed sockets unusable for /pair and /qr.
+        sock = null;
+        connecting = false;
+        notifyWaiters();
+
         if (shouldReconnect) {
           setTimeout(() => {
-            connecting = false;
             startSocket().catch((err) => logger.error(err, "reconnect failed"));
-          }, 5_000);
+          }, 2_000);
         } else {
-          logger.error("Session logged out/replaced. Clear session and pair again.");
+          logger.error("Session logged out/replaced. Clear session and pair again if needed.");
         }
       }
     });
@@ -121,14 +183,39 @@ async function startSocket() {
   }
 }
 
-async function requestPairingCode() {
-  if (!sock) await startSocket();
+async function waitForPairingReady(timeoutMs = 25_000) {
+  const started = Date.now();
 
-  if (sock.authState.creds.registered) {
+  while (Date.now() - started < timeoutMs) {
+    if (latestQr || connectionState === "connecting") return true;
+    if (connectionState === "open") return true;
+
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 500);
+      waiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  return false;
+}
+
+async function requestPairingCode() {
+  await ensureFreshSocket();
+
+  if (!sock) throw new Error("Socket is not ready");
+  if (sock.authState.creds.registered || connectionState === "open") {
     return { registered: true, code: null };
   }
 
-  await waitForSocketBeforePairing(12_000);
+  const ready = await waitForPairingReady(25_000);
+  if (!ready) {
+    throw new Error("Socket not ready for pairing. Try /restart then /pair again, or use /qr.");
+  }
+
+  if (!sock) throw new Error("Socket closed before requesting pairing code");
 
   const code = await sock.requestPairingCode(BOT_PHONE_NUMBER);
   lastPairingCode = code;
@@ -138,14 +225,21 @@ async function requestPairingCode() {
   return { registered: false, code };
 }
 
-async function waitForSocketBeforePairing(timeoutMs) {
-  const started = Date.now();
+async function getQrDataUrl() {
+  await ensureFreshSocket();
 
-  while (Date.now() - started < timeoutMs) {
-    if (!sock) break;
-    if (connectionState === "connecting" || connectionState === "open") return;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  if (connectionState === "open") return null;
+
+  const ready = await waitForPairingReady(25_000);
+  if (!ready || !latestQr) {
+    throw new Error("QR not ready yet. Refresh this endpoint in a few seconds or call /restart.");
   }
+
+  return QRCode.toDataURL(latestQr, {
+    errorCorrectionLevel: "M",
+    margin: 2,
+    scale: 8
+  });
 }
 
 function getReadableContent(message) {
@@ -265,6 +359,8 @@ function publicStatus() {
     startedAt,
     lastDisconnectReason: lastDisconnectReason || null,
     lastPairingAt,
+    hasQr: Boolean(latestQr),
+    latestQrAt,
     uptimeSeconds: Math.round(process.uptime()),
     memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024)
   };
@@ -285,7 +381,8 @@ async function main() {
           <h1>WA Sticker Bot</h1>
           <p>Status: <b>${connectionState}</b></p>
           <p>Health: <a href="/health">/health</a></p>
-          <p>Pairing: <code>/pair?key=ADMIN_KEY</code></p>
+          <p>Pairing code: <code>/pair?key=ADMIN_KEY</code></p>
+          <p>QR fallback: <code>/qr?key=ADMIN_KEY</code></p>
         </body>
       </html>
     `);
@@ -325,8 +422,65 @@ async function main() {
       logger.error(error, "pairing code failed");
       res.status(500).json({
         ok: false,
-        error: String(error?.message || error)
+        error: String(error?.message || error),
+        suggestion: "Call POST /restart?key=ADMIN_KEY, wait 5 seconds, then try /pair again. If it still fails, use /qr."
       });
+    }
+  });
+
+  app.get("/qr", async (req, res) => {
+    if (!isAdmin(req)) return res.status(401).send("Unauthorized");
+
+    try {
+      const dataUrl = await getQrDataUrl();
+
+      if (!dataUrl) {
+        return res.type("html").send(`
+          <html>
+            <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
+              <h1>Already connected</h1>
+              <p>WhatsApp state is <b>${connectionState}</b>.</p>
+            </body>
+          </html>
+        `);
+      }
+
+      res.type("html").send(`
+        <html>
+          <head>
+            <title>WA Sticker Bot QR</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+          </head>
+          <body style="font-family: system-ui; max-width: 720px; margin: 32px auto; text-align: center; line-height: 1.5;">
+            <h1>Scan QR WhatsApp</h1>
+            <p>QR ini cepat kedaluwarsa. Kalau gagal, refresh halaman.</p>
+            <img src="${dataUrl}" style="width: min(88vw, 420px); height: auto; image-rendering: pixelated;" />
+            <p><small>State: ${connectionState} | QR at: ${latestQrAt || "-"}</small></p>
+          </body>
+        </html>
+      `);
+    } catch (error) {
+      logger.error(error, "qr failed");
+      res.status(500).type("html").send(`
+        <html>
+          <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
+            <h1>QR belum siap</h1>
+            <pre>${String(error?.message || error)}</pre>
+            <p>Coba refresh halaman, atau panggil POST /restart?key=ADMIN_KEY.</p>
+          </body>
+        </html>
+      `);
+    }
+  });
+
+  app.post("/restart", async (req, res) => {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
+
+    try {
+      await restartSocket({ clearSession: false });
+      res.json({ ok: true, message: "Socket restarted. Wait a few seconds, then open /pair or /qr." });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error?.message || error) });
     }
   });
 
@@ -337,10 +491,8 @@ async function main() {
       if (sock?.logout) {
         await sock.logout().catch(() => {});
       }
-      await clearAuthState();
-      sock = null;
-      connectionState = "logged_out";
-      res.json({ ok: true, message: "Session cleared. Restart service, then open /pair again." });
+      await restartSocket({ clearSession: true });
+      res.json({ ok: true, message: "Session cleared. Wait a few seconds, then open /pair or /qr." });
     } catch (error) {
       res.status(500).json({ ok: false, error: String(error?.message || error) });
     }

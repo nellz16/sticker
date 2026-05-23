@@ -1,107 +1,37 @@
-# WA Sticker Bot on Koyeb + Turso
+# WA Sticker Bot on Koyeb + Turso v3
 
-Bot pribadi untuk mengubah gambar yang dikirim ke WhatsApp menjadi sticker WebP 512x512 tanpa outline putih dan tanpa auto-remove background.
+Perbaikan v3:
+- Endpoint pairing code dibuat lebih aman: menunggu event `connecting` atau `qr`.
+- Jika socket sudah `close`, endpoint `/pair` otomatis membuat socket baru.
+- Tambah fallback endpoint QR: `/qr?key=ADMIN_KEY`.
+- Tambah endpoint `/restart?key=ADMIN_KEY`.
+- Setelah pairing/scan, disconnect `restartRequired` dianggap normal dan auto-reconnect.
 
-## Ringkas
+## Endpoint
 
-- Runtime: Koyeb Web Service
-- WA library: Baileys v7.0.0-rc13
-- Auth/session: Turso SQLite/libSQL
-- Keep-alive: UptimeRobot ping `/health` tiap 5 menit
-- Pairing: kode pairing, bukan QR
-
-## Environment variables
-
-Lihat `.env.example`.
-
-Wajib di Koyeb:
-
-```env
-TURSO_DATABASE_URL=...
-TURSO_AUTH_TOKEN=...
-BOT_PHONE_NUMBER=628xxxxxxxxxx
-OWNER_NUMBERS=628xxxxxxxxxx
-ADMIN_KEY=secret-panjang
-SESSION_ID=main
+```text
+GET  /health
+GET  /status?key=ADMIN_KEY
+GET  /pair?key=ADMIN_KEY
+GET  /qr?key=ADMIN_KEY
+POST /restart?key=ADMIN_KEY
+POST /logout?key=ADMIN_KEY
 ```
-
-`BOT_PHONE_NUMBER` adalah nomor WhatsApp cadangan yang akan dijadikan bot. Jangan pakai tanda `+`.
-
-`OWNER_NUMBERS` adalah nomor yang boleh memakai bot, pisahkan koma jika lebih dari satu. Contoh:
-
-```env
-OWNER_NUMBERS=6281111111111,6282222222222
-```
-
-## Deploy Koyeb
-
-1. Push folder ini ke GitHub.
-2. Koyeb → Create Web Service → GitHub repo.
-3. Builder: Dockerfile.
-4. Instance: Free.
-5. Exposed port: 8000, atau biarkan Koyeb pakai `PORT`.
-6. Isi environment variables.
-7. Deploy.
 
 ## Pairing via code
-
-Buka endpoint ini di browser:
 
 ```text
 https://APP-KAMU.koyeb.app/pair?key=ADMIN_KEY
 ```
 
-Jika sukses, akan muncul kode pairing.
-
-Di WhatsApp pada HP nomor bot:
+Jika gagal beberapa kali, tunggu 15-30 menit, restart service, lalu coba QR:
 
 ```text
-Settings / Setelan
-→ Linked Devices / Perangkat tertaut
-→ Link a device / Tautkan perangkat
-→ Link with phone number instead / Tautkan dengan nomor telepon
-→ Masukkan kode
+https://APP-KAMU.koyeb.app/qr?key=ADMIN_KEY
 ```
 
-## UptimeRobot
+## QR via 1 HP
 
-Buat monitor HTTP(s):
-
-```text
-URL: https://APP-KAMU.koyeb.app/health
-Interval: 5 minutes
-```
-
-## Cara pakai
-
-Kirim gambar ke nomor bot. Bot akan membalas sticker.
-
-Caption opsional:
-
-```text
-cover   = crop penuh 512x512
-contain = gambar utuh, default
-text    = optimasi screenshot/tulisan
-icon    = optimasi logo/icon
-photo   = optimasi foto
-pixel   = pixel art, tidak blur/smoothing
-white   = background putih
-nopad   = tanpa margin tambahan jika memungkinkan
-```
-
-Contoh caption:
-
-```text
-text nopad
-```
-
-## Endpoint admin
-
-```text
-GET /health
-GET /pair?key=ADMIN_KEY
-GET /status?key=ADMIN_KEY
-POST /logout?key=ADMIN_KEY
-```
-
-`/logout` akan menghapus sesi Baileys dari Turso, sehingga perlu pairing ulang.
+Buka endpoint QR di browser HP yang sama, lalu screenshot/zoom QR. Dari WhatsApp:
+Setelan → Perangkat tertaut → Tautkan perangkat → Scan QR.
+Kalau tidak bisa scan dari HP yang sama, buka URL QR di laptop/HP lain.
