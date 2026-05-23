@@ -6,7 +6,7 @@ ENV NODE_ENV=production
 ENV NPM_CONFIG_LOGLEVEL=warn
 
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm install --omit=dev --no-audit --no-fund
 
 COPY src ./src
 

@@ -1,4 +1,4 @@
-import { BufferJSON, initAuthCreds, proto } from "@whiskeysockets/baileys";
+import { BufferJSON, initAuthCreds, proto } from "baileys";
 import { getKv, setKv, deleteKv, deleteKvPrefix } from "./db.js";
 
 const SESSION_ID = process.env.SESSION_ID || "main";
@@ -41,7 +41,7 @@ export async function useTursoAuthState() {
               let value = await readData(`${type}-${id}`);
 
               if (type === "app-state-sync-key" && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                value = proto.Message.AppStateSyncKeyData.create(value);
               }
 
               data[id] = value;

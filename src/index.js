@@ -5,8 +5,9 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
-  jidNormalizedUser
-} from "@whiskeysockets/baileys";
+  jidNormalizedUser,
+  normalizeMessageContent
+} from "baileys";
 
 import { initDb, logEvent } from "./db.js";
 import { useTursoAuthState, clearAuthState } from "./auth-turso.js";
@@ -59,14 +60,15 @@ async function startSocket() {
     sock = makeWASocket({
       auth: state,
       logger,
-      browser: Browsers.ubuntu("Chrome"),
+      browser: Browsers.macOS("Google Chrome"),
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60_000,
       keepAliveIntervalMs: 20_000,
-      defaultQueryTimeoutMs: 60_000
+      defaultQueryTimeoutMs: 60_000,
+      getMessage: async () => undefined
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -89,14 +91,16 @@ async function startSocket() {
 
         await logEvent("connection_close", lastDisconnectReason);
 
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-        if (!loggedOut) {
+        const shouldReconnect =
+          statusCode !== DisconnectReason.loggedOut &&
+          statusCode !== DisconnectReason.connectionReplaced;
+        if (shouldReconnect) {
           setTimeout(() => {
             connecting = false;
             startSocket().catch((err) => logger.error(err, "reconnect failed"));
           }, 5_000);
         } else {
-          logger.error("Session logged out. Clear session and pair again.");
+          logger.error("Session logged out/replaced. Clear session and pair again.");
         }
       }
     });
@@ -124,7 +128,7 @@ async function requestPairingCode() {
     return { registered: true, code: null };
   }
 
-  await new Promise((resolve) => setTimeout(resolve, 1500));
+  await waitForSocketBeforePairing(12_000);
 
   const code = await sock.requestPairingCode(BOT_PHONE_NUMBER);
   lastPairingCode = code;
@@ -134,30 +138,19 @@ async function requestPairingCode() {
   return { registered: false, code };
 }
 
-function getReadableContent(message) {
-  let content = message?.message;
+async function waitForSocketBeforePairing(timeoutMs) {
+  const started = Date.now();
 
-  for (let i = 0; i < 5; i++) {
-    if (content?.ephemeralMessage?.message) {
-      content = content.ephemeralMessage.message;
-      continue;
-    }
-    if (content?.viewOnceMessage?.message) {
-      content = content.viewOnceMessage.message;
-      continue;
-    }
-    if (content?.viewOnceMessageV2?.message) {
-      content = content.viewOnceMessageV2.message;
-      continue;
-    }
-    if (content?.documentWithCaptionMessage?.message) {
-      content = content.documentWithCaptionMessage.message;
-      continue;
-    }
-    break;
+  while (Date.now() - started < timeoutMs) {
+    if (!sock) break;
+    if (connectionState === "connecting" || connectionState === "open") return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
+}
 
-  return content || {};
+function getReadableContent(message) {
+  const normalized = normalizeMessageContent(message?.message);
+  return normalized || {};
 }
 
 function getPrivateNumberFromJid(jid) {
@@ -176,7 +169,7 @@ async function handleIncomingMessage(msg) {
   if (!msg?.message || msg.key?.fromMe) return;
 
   const jid = msg.key.remoteJid;
-  if (!jid || jid.endsWith("@g.us")) return;
+  if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") return;
 
   if (!isAllowedSender(jid)) {
     logger.warn({ jid }, "Ignoring non-owner sender");

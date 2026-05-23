@@ -5,7 +5,7 @@ Bot pribadi untuk mengubah gambar yang dikirim ke WhatsApp menjadi sticker WebP 
 ## Ringkas
 
 - Runtime: Koyeb Web Service
-- WA library: Baileys
+- WA library: Baileys v7.0.0-rc13
 - Auth/session: Turso SQLite/libSQL
 - Keep-alive: UptimeRobot ping `/health` tiap 5 menit
 - Pairing: kode pairing, bukan QR

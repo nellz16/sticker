@@ -1,6 +1,6 @@
 {
   "name": "wa-sticker-bot-koyeb",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,10 +12,10 @@
   },
   "dependencies": {
     "@libsql/client": "^0.15.15",
-    "@whiskeysockets/baileys": "6.7.18",
+    "baileys": "7.0.0-rc13",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "pino": "^9.6.0",
-    "sharp": "^0.33.5"
+    "sharp": "^0.34.5"
   }
 }
