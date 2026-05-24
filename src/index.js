@@ -13,9 +13,9 @@ import makeWASocket, {
 
 import { initDb, logEvent, addOwner, removeOwner, listOwners, isDbOwner } from "./db.js";
 import { useTursoAuthState, clearAuthState } from "./auth-turso.js";
-import { makeSticker, parseStickerOptions } from "./sticker.js";
+import { makeSticker, parseStickerOptions, getSharpDiagnostics, trimSharpCache } from "./sticker.js";
 
-const BUILD_VERSION = "8.0.0";
+const BUILD_VERSION = "9.0.0";
 const PORT = Number(process.env.PORT || 8000);
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const ADMIN_KEY = process.env.ADMIN_KEY;
@@ -37,6 +37,10 @@ const QR_WAIT_TIMEOUT_MS = Number(process.env.QR_WAIT_TIMEOUT_MS || 35000);
 const WA_COUNTRY_CODE = process.env.WA_COUNTRY_CODE || "ID";
 const WA_BROWSER = (process.env.WA_BROWSER || "ubuntu").toLowerCase();
 
+const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 8 * 1024 * 1024);
+const MEMORY_RESTART_MB = Number(process.env.MEMORY_RESTART_MB || 460);
+const LOG_MEMORY_AFTER_STICKER = String(process.env.LOG_MEMORY_AFTER_STICKER || "false").toLowerCase() === "true";
+
 const logger = pino({ level: LOG_LEVEL });
 
 if (!ADMIN_KEY) throw new Error("Missing ADMIN_KEY");
@@ -55,6 +59,7 @@ let startedAt = new Date().toISOString();
 let processedQueue = Promise.resolve();
 let waiters = [];
 let activePairingUntil = 0;
+let stickersProcessed = 0;
 
 function cleanNumber(value) {
   return String(value).replace(/[^\d]/g, "");
@@ -62,6 +67,60 @@ function cleanNumber(value) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function mb(bytes) {
+  return Math.round((Number(bytes) || 0) / 1024 / 1024);
+}
+
+function memorySnapshot() {
+  const m = process.memoryUsage();
+
+  return {
+    rssMb: mb(m.rss),
+    heapTotalMb: mb(m.heapTotal),
+    heapUsedMb: mb(m.heapUsed),
+    externalMb: mb(m.external),
+    arrayBuffersMb: mb(m.arrayBuffers),
+    stickersProcessed,
+    sharp: getSharpDiagnostics()
+  };
+}
+
+async function cleanupMemory(reason = "manual") {
+  trimSharpCache();
+
+  if (global.gc) {
+    global.gc();
+    await delay(20);
+    global.gc();
+  }
+
+  const snapshot = memorySnapshot();
+
+  logger.info({ reason, memory: snapshot }, "Memory cleanup completed");
+
+  if (
+    MEMORY_RESTART_MB > 0 &&
+    snapshot.rssMb >= MEMORY_RESTART_MB &&
+    connectionState === "open" &&
+    !isPairingActive()
+  ) {
+    logger.warn(
+      { rssMb: snapshot.rssMb, limitMb: MEMORY_RESTART_MB },
+      "RSS is near memory limit; exiting gracefully so Koyeb can restart with a fresh process."
+    );
+
+    setTimeout(() => process.exit(0), 1000).unref();
+  }
+
+  return snapshot;
+}
+
+function getMediaFileLength(mediaMessage) {
+  const value = mediaMessage?.fileLength;
+  if (!value) return 0;
+  return Number(value?.toString?.() || value || 0);
 }
 
 function isAdmin(req) {
@@ -558,31 +617,58 @@ async function handleIncomingMessage(msg) {
     return;
   }
 
+  const selectedMedia = imageMessage || documentMessage;
+  const fileLength = getMediaFileLength(selectedMedia);
+
+  if (fileLength > MAX_INPUT_BYTES) {
+    await sock.sendMessage(
+      jid,
+      { text: `Gambar terlalu besar (${mb(fileLength)} MB). Batas saat ini ${mb(MAX_INPUT_BYTES)} MB agar RAM Koyeb aman.` },
+      { quoted: msg }
+    );
+    return;
+  }
+
   await sock.sendPresenceUpdate("composing", jid);
 
-  const mediaBuffer = await downloadMediaMessage(
-    msg,
-    "buffer",
-    {},
-    {
-      logger,
-      reuploadRequest: sock.updateMediaMessage
+  let mediaBuffer = null;
+  let result = null;
+
+  try {
+    mediaBuffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      {
+        logger,
+        reuploadRequest: sock.updateMediaMessage
+      }
+    );
+
+    const caption = imageMessage?.caption || documentMessage?.caption || "";
+    const options = parseStickerOptions(caption);
+    result = await makeSticker(mediaBuffer, options);
+
+    await sock.sendMessage(
+      jid,
+      {
+        sticker: result.buffer
+      },
+      { quoted: msg }
+    );
+
+    stickersProcessed += 1;
+
+    await logEvent("sticker_sent", `${result.bytes} bytes, q=${result.quality}, box=${result.boxSize}, effort=${result.webpEffort}`);
+
+    if (LOG_MEMORY_AFTER_STICKER) {
+      logger.info({ memory: memorySnapshot() }, "Memory after sticker");
     }
-  );
-
-  const caption = imageMessage?.caption || documentMessage?.caption || "";
-  const options = parseStickerOptions(caption);
-  const result = await makeSticker(mediaBuffer, options);
-
-  await sock.sendMessage(
-    jid,
-    {
-      sticker: result.buffer
-    },
-    { quoted: msg }
-  );
-
-  await logEvent("sticker_sent", `${result.bytes} bytes, q=${result.quality}, box=${result.boxSize}`);
+  } finally {
+    mediaBuffer = null;
+    result = null;
+    await cleanupMemory("after-sticker");
+  }
 }
 
 
@@ -759,7 +845,8 @@ function publicStatus() {
     memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
     ownerNumbersConfigured: OWNER_NUMBERS.length,
     ownerLidsConfigured: OWNER_LIDS.length,
-    allowAllPrivate: ALLOW_ALL_PRIVATE
+    allowAllPrivate: ALLOW_ALL_PRIVATE,
+    memory: memorySnapshot()
   };
 }
 
@@ -805,7 +892,7 @@ async function main() {
           <h1>WA Sticker Bot</h1>
           <p>Build: <b>${BUILD_VERSION}</b></p>
           <p>Status: <b>${connectionState}</b></p>
-          <p>Health: <a href="/health">/health</a></p>
+          <p>Health: <a href="/health">/health</a></p><p>Memory: <code>/memory?key=ADMIN_KEY</code></p>
           <p>Pairing code fresh: <code>/pair?key=ADMIN_KEY&fresh=1</code></p>
           <p>QR fresh: <code>/qr?key=ADMIN_KEY&fresh=1</code></p>
         </body>
@@ -820,6 +907,16 @@ async function main() {
   app.get("/status", (req, res) => {
     if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
     res.json(publicStatus());
+  });
+
+  app.get("/memory", (req, res) => {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
+    res.json({ ok: true, memory: memorySnapshot() });
+  });
+
+  app.post("/gc", async (req, res) => {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Unauthorized" });
+    res.json({ ok: true, memory: await cleanupMemory("manual-endpoint") });
   });
 
   app.get("/pair", async (req, res) => {

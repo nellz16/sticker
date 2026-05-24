@@ -4,6 +4,19 @@ sharp.cache(false);
 sharp.concurrency(1);
 
 const MAX_STICKER_BYTES = Number(process.env.MAX_STICKER_BYTES || 100 * 1024);
+const WEBP_EFFORT = Number(process.env.WEBP_EFFORT || 4);
+const QUALITY_ATTEMPTS = Number(process.env.QUALITY_ATTEMPTS || 6);
+const MAX_INPUT_PIXELS = Number(process.env.MAX_INPUT_PIXELS || 12_000_000);
+
+function parseBoxSizes() {
+  const raw = process.env.BOX_SIZES || "";
+  const parsed = raw
+    .split(",")
+    .map((x) => Number(x.trim()))
+    .filter((x) => Number.isInteger(x) && x > 0 && x <= 512);
+
+  return parsed.length ? parsed : null;
+}
 
 export function parseStickerOptions(text = "") {
   const caption = text.toLowerCase();
@@ -35,24 +48,28 @@ export function parseStickerOptions(text = "") {
 }
 
 export async function makeSticker(inputBuffer, options = {}) {
-  const boxSizes = options.noPad
-    ? [512, 496, 480, 448, 416, 384]
-    : [512, 504, 496, 480, 464, 448, 416, 384, 352, 320];
+  const envBoxSizes = parseBoxSizes();
 
-  let smallest = null;
+  const boxSizes = envBoxSizes || (
+    options.noPad
+      ? [512, 496, 480, 448, 416, 384]
+      : [512, 496, 480, 448, 416, 384, 352]
+  );
+
+  let smallestBytes = Number.POSITIVE_INFINITY;
 
   for (const boxSize of boxSizes) {
     let low = options.high ? 45 : 32;
-    let high = options.high ? 98 : 94;
+    let high = options.high ? 98 : 92;
     let bestUnderLimit = null;
     let bestQuality = 0;
 
-    for (let attempt = 0; attempt < 8; attempt++) {
+    for (let attempt = 0; attempt < QUALITY_ATTEMPTS; attempt++) {
       const quality = Math.floor((low + high) / 2);
       const output = await renderWebp(inputBuffer, { ...options, boxSize, quality });
 
-      if (!smallest || output.length < smallest.length) {
-        smallest = output;
+      if (output.length < smallestBytes) {
+        smallestBytes = output.length;
       }
 
       if (output.length <= MAX_STICKER_BYTES) {
@@ -69,13 +86,13 @@ export async function makeSticker(inputBuffer, options = {}) {
         buffer: bestUnderLimit,
         bytes: bestUnderLimit.length,
         boxSize,
-        quality: bestQuality
+        quality: bestQuality,
+        webpEffort: WEBP_EFFORT
       };
     }
   }
 
-  const finalSize = smallest?.length || 0;
-  throw new Error(`Cannot compress sticker under ${MAX_STICKER_BYTES} bytes. Smallest=${finalSize}`);
+  throw new Error(`Cannot compress sticker under ${MAX_STICKER_BYTES} bytes. Smallest=${smallestBytes}`);
 }
 
 async function renderWebp(inputBuffer, options) {
@@ -94,7 +111,7 @@ async function renderWebp(inputBuffer, options) {
 
   const kernel = pixel ? sharp.kernel.nearest : sharp.kernel.lanczos3;
 
-  let pipeline = sharp(inputBuffer, { failOn: "none", limitInputPixels: 25_000_000 })
+  let pipeline = sharp(inputBuffer, { failOn: "none", limitInputPixels: MAX_INPUT_PIXELS })
     .rotate()
     .resize({
       width: boxSize,
@@ -120,13 +137,28 @@ async function renderWebp(inputBuffer, options) {
     });
   }
 
-  return pipeline
+  const buffer = await pipeline
     .webp({
       quality,
       alphaQuality: 100,
-      effort: 6,
+      effort: WEBP_EFFORT,
       smartSubsample: true,
       preset
     })
     .toBuffer();
+
+  if (pipeline?.destroy) pipeline.destroy();
+  return buffer;
+}
+
+export function getSharpDiagnostics() {
+  return {
+    cache: sharp.cache(),
+    counters: sharp.counters(),
+    concurrency: sharp.concurrency()
+  };
+}
+
+export function trimSharpCache() {
+  sharp.cache(false);
 }

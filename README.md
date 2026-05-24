@@ -1,6 +1,13 @@
-# WA Sticker Bot on Koyeb + Turso v8
+# WA Sticker Bot on Koyeb + Turso v9
 
-Perbaikan v8:
+Perbaikan v9:
+- Optimasi RAM/CPU untuk Koyeb Free 512MB.
+- Node dijalankan dengan `--expose-gc --max-old-space-size=192`.
+- Sharp WebP effort default diturunkan ke 4 agar CPU 0.1 vCPU tidak terlalu lama 100%.
+- Batasi input gambar besar via `MAX_INPUT_BYTES` dan `MAX_INPUT_PIXELS`.
+- Tambah cleanup setelah setiap sticker: trim Sharp cache + manual GC jika tersedia.
+- Tambah `/memory?key=...` dan `POST /gc?key=...`.
+- Auto graceful restart jika RSS melewati `MEMORY_RESTART_MB`.
 - Tambah owner whitelist dinamis di Turso: tidak perlu edit env untuk tambah nomor/LID.
 - Tambah `/claim ADMIN_KEY` agar nomor yang sedang chat bisa mendaftarkan dirinya sendiri.
 - Tambah `/addowner`, `/removeowner`, dan `/owners`.
@@ -141,3 +148,33 @@ Command lain:
 ```
 
 `OWNER_NUMBERS` dan `OWNER_LIDS` tetap boleh dipakai sebagai bootstrap/fallback, tetapi v8 lebih nyaman memakai DB owner.
+
+
+## Memory tuning v9
+
+Endpoint:
+
+```text
+GET  /memory?key=ADMIN_KEY
+POST /gc?key=ADMIN_KEY
+```
+
+Env yang disarankan untuk Koyeb Free:
+
+```env
+MAX_INPUT_BYTES=8388608
+MAX_INPUT_PIXELS=12000000
+WEBP_EFFORT=4
+QUALITY_ATTEMPTS=6
+MEMORY_RESTART_MB=460
+LOG_MEMORY_AFTER_STICKER=false
+```
+
+Kalau ingin kualitas sedikit lebih tinggi tapi CPU lebih berat:
+
+```env
+WEBP_EFFORT=5
+QUALITY_ATTEMPTS=7
+```
+
+Kalau RAM sering naik mendekati 450MB, biarkan `MEMORY_RESTART_MB=460`. Bot akan keluar dengan aman setelah selesai memproses sticker, lalu Koyeb menyalakan proses baru dan Baileys reconnect memakai session Turso.
